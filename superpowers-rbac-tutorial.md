@@ -451,3 +451,38 @@ Superpowers 和 ui-ux-pro-max 的真正价值，不在于它们能把 AI 变成"
 它们不是所有项目都需要的东西，也不是装完就一定立刻见效的东西。你还是得判断任务值不值得走完整流程，还是得亲自做关键决策，还是得面对代码基线、团队习惯和项目复杂度这些很现实的问题。
 
 Superpowers 适合把大任务拉回工程轨道，ui-ux-pro-max 适合把前端结果拉回产品语境。它们真正有用的时候，通常不是在"随便试试"的那一刻，而是在你开始认真交付一个项目的时候。
+
+
+// 1. 获取所有的 h1 标签
+const headings = document.querySelectorAll('h1');
+let lastSeenH1Id = '';
+
+// 2. 创建观察器：处理 h1 的进入
+const h1Observer = new IntersectionObserver((entries) => {
+  entries.forEach(entry => {
+    // isIntersecting 表示元素出现在了视口内
+    if (entry.isIntersecting) {
+      const id = entry.target.id;
+      lastSeenH1Id = id; // 记录最后一个看到的 h1
+      console.log('当前滚动到 H1:', id);
+    }
+  });
+}, {
+  threshold: 0.1, // 只要有 10% 露出就触发
+  rootMargin: "0px 0px -50% 0px" // 只有进入视口上半部分才算“到达”
+});
+
+// 开始观察每一个 h1
+headings.forEach(h1 => h1Observer.observe(h1));
+
+// 3. 观测底部：判断是否滚动到底
+const footerSentinel = document.createElement('div');
+document.body.appendChild(footerSentinel); // 在页面最后插入一个哨兵元素
+
+const bottomObserver = new IntersectionObserver((entries) => {
+  if (entries[0].isIntersecting) {
+    console.log('已滚动到底部，最后一个 H1 的 ID 是:', lastSeenH1Id);
+  }
+}, { threshold: 1.0 });
+
+bottomObserver.observe(footerSentinel);
