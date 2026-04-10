@@ -10,7 +10,42 @@
 
 这是最终完成初版的多租户 RBAC 系统项目，仓库地址为 https://github.com/Cookieboty/Autix。感兴趣的同学可以 Star 支持一下。需要注意的是，这个项目虽然是按下文流程 VB 出来的，但过程中也做了不少 bug 处理；另外，受 AI 幻觉影响，部分分支出现过偏差，因此做了一些调整，但整体流程基本可控。
 
+
 ---
+
+// 1. 获取所有的 h1 标签
+const headings = document.querySelectorAll('h1');
+let lastSeenH1Id = '';
+
+// 2. 创建观察器：处理 h1 的进入
+const h1Observer = new IntersectionObserver((entries) => {
+  entries.forEach(entry => {
+    // isIntersecting 表示元素出现在了视口内
+    if (entry.isIntersecting) {
+      const id = entry.target.id;
+      lastSeenH1Id = id; // 记录最后一个看到的 h1
+      console.log('当前滚动到 H1:', id);
+    }
+  });
+}, {
+  threshold: 0.1, // 只要有 10% 露出就触发
+  rootMargin: "0px 0px -50% 0px" // 只有进入视口上半部分才算“到达”
+});
+
+// 开始观察每一个 h1
+headings.forEach(h1 => h1Observer.observe(h1));
+
+// 3. 观测底部：判断是否滚动到底
+const footerSentinel = document.createElement('div');
+document.body.appendChild(footerSentinel); // 在页面最后插入一个哨兵元素
+
+const bottomObserver = new IntersectionObserver((entries) => {
+  if (entries[0].isIntersecting) {
+    console.log('已滚动到底部，最后一个 H1 的 ID 是:', lastSeenH1Id);
+  }
+}, { threshold: 1.0 });
+
+bottomObserver.observe(footerSentinel);
 
 ## 一、Superpowers 与 ui-ux-pro-max 的定位
 
