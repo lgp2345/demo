@@ -1,17 +1,12 @@
 // src/utils/long-png/types.ts
 
-export interface LongPngProgress {
-  /**
-   * capture:
-   * html2canvas 正在截图
-   *
-   * encode:
-   * Worker 正在编码 PNG
-   *
-   * done:
-   * 完成
-   */
-  phase: 'capture' | 'encode' | 'done';
+export type ExportPhase =
+  | 'capture'
+  | 'encode'
+  | 'done';
+
+export interface ExportProgress {
+  phase: ExportPhase;
 
   /**
    * 0 ~ 1
@@ -19,7 +14,7 @@ export interface LongPngProgress {
   progress: number;
 
   /**
-   * 当前分片
+   * 当前第几个分片
    */
   current: number;
 
@@ -31,45 +26,60 @@ export interface LongPngProgress {
 
 export interface ExportLongPngOptions {
   /**
-   * html2canvas scale
+   * 导出倍率。
    *
-   * 强烈推荐 1
+   * 推荐：
+   * scale: 1
+   *
+   * 1920px DOM 最终就是 1920px PNG。
    */
   scale?: number;
 
   /**
-   * 每次截图高度。
+   * 每次 html2canvas 截多少 CSS px 高度。
    *
-   * 不传则自动计算。
+   * 不填写则自动计算。
    */
   chunkHeight?: number;
 
   /**
-   * PNG 压缩级别
+   * 单个 Canvas 最大像素预算。
    *
-   * 0 ~ 9
-   *
-   * 推荐 3
+   * 默认 8,000,000 像素。
    */
-  compressionLevel?: number;
+  pixelBudget?: number;
 
   /**
-   * 背景色
+   * 背景色。
    */
   backgroundColor?: string | null;
 
   /**
-   * 是否启用跨域图片
+   * 是否使用 CORS 加载图片。
    */
   useCORS?: boolean;
 
   /**
-   * 导出进度
+   * html2canvas clone viewport 宽度。
+   *
+   * 默认使用元素宽度。
    */
-  onProgress?: (progress: LongPngProgress) => void;
+  windowWidth?: number;
 
   /**
-   * AbortController
+   * html2canvas clone viewport 高度。
+   */
+  windowHeight?: number;
+
+  /**
+   * 进度。
+   */
+  onProgress?: (
+    progress: ExportProgress,
+  ) => void;
+
+  /**
+   * 取消导出。
    */
   signal?: AbortSignal;
 }
