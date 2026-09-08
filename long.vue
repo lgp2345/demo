@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import {
+  computed,
   ref,
 } from 'vue';
 
@@ -9,7 +10,9 @@ import {
 } from '@/utils/long-png/exportLongPng';
 
 const reportRef =
-  ref<HTMLElement>();
+  ref<HTMLElement | null>(
+    null,
+  );
 
 const exporting =
   ref(false);
@@ -20,12 +23,40 @@ const progress =
 const progressText =
   ref('');
 
-let controller:
+let abortController:
   | AbortController
   | undefined;
 
+const progressStyle =
+  computed(() => ({
+    width:
+      `${progress.value}%`,
+  }));
+
+function formatFileSize(
+  bytes: number,
+) {
+  if (
+    bytes <
+    1024 * 1024
+  ) {
+    return `${(
+      bytes / 1024
+    ).toFixed(2)} KB`;
+  }
+
+  return `${(
+    bytes /
+    1024 /
+    1024
+  ).toFixed(2)} MB`;
+}
+
 async function handleExport() {
-  if (!reportRef.value) {
+  if (
+    !reportRef.value ||
+    exporting.value
+  ) {
     return;
   }
 
@@ -33,7 +64,10 @@ async function handleExport() {
 
   progress.value = 0;
 
-  controller =
+  progressText.value =
+    '准备导出';
+
+  abortController =
     new AbortController();
 
   try {
@@ -42,31 +76,43 @@ async function handleExport() {
         reportRef.value,
         {
           /**
-           * 强烈建议 1。
+           * 你的场景建议一定先用 1。
            */
           scale: 1,
 
           /**
-           * 可以不传，
-           * 让程序自动计算。
+           * 可以不填写。
+           *
+           * 会根据像素预算
+           * 自动计算。
            */
-          // chunkHeight: 2000,
+          // chunkHeight: 3000,
 
           /**
-           * 速度 / 文件大小
-           * 比较好的平衡。
+           * 单 Canvas 控制在
+           * 约 800 万像素以内。
            */
-          compressionLevel: 3,
+          pixelBudget:
+            8_000_000,
 
           backgroundColor:
             '#ffffff',
 
           useCORS: true,
 
-          signal:
-            controller.signal,
+          /**
+           * 保持 1920
+           * 设计稿 viewport。
+           */
+          windowWidth:
+            1920,
 
-          onProgress(info) {
+          signal:
+            abortController.signal,
+
+          onProgress(
+            info,
+          ) {
             progress.value =
               Math.round(
                 info.progress *
@@ -78,13 +124,19 @@ async function handleExport() {
             ) {
               case 'capture':
                 progressText.value =
-                  `正在截图 ${info.current}/${info.total}`;
+                  [
+                    '正在截图',
+                    `${info.current}/${info.total}`,
+                  ].join(' ');
 
                 break;
 
               case 'encode':
                 progressText.value =
-                  `正在编码 ${info.current}/${info.total}`;
+                  [
+                    '正在压缩',
+                    `${info.current}/${info.total}`,
+                  ].join(' ');
 
                 break;
 
@@ -98,12 +150,16 @@ async function handleExport() {
         },
       );
 
-    /**
-     * 最终只有一张 PNG。
-     */
+    console.log(
+      'PNG:',
+      formatFileSize(
+        blob.size,
+      ),
+    );
+
     downloadBlob(
       blob,
-      '完整长图.png',
+      `完整长图-${Date.now()}.png`,
     );
   } catch (error) {
     if (
@@ -112,16 +168,19 @@ async function handleExport() {
       error.name ===
         'AbortError'
     ) {
-      console.log(
-        '导出已取消',
-      );
+      progressText.value =
+        '已取消';
 
       return;
     }
 
     console.error(
+      '[export]',
       error,
     );
+
+    progressText.value =
+      '导出失败';
 
     alert(
       error instanceof Error
@@ -132,32 +191,24 @@ async function handleExport() {
     exporting.value =
       false;
 
-    controller =
+    abortController =
       undefined;
   }
 }
 
 function handleCancel() {
-  controller?.abort();
+  abortController?.abort();
 }
 </script>
 
 <template>
-  <div>
-    <div
-      style="
-        position: sticky;
-        top: 0;
-        z-index: 100;
-        padding: 12px;
-        background: white;
-      "
-    >
+  <div class="page">
+    <div class="toolbar">
       <button
         :disabled="exporting"
         @click="handleExport"
       >
-        导出完整长图
+        {{ exporting ? '导出中...' : '导出完整长图' }}
       </button>
 
       <button
@@ -167,48 +218,106 @@ function handleCancel() {
         取消
       </button>
 
-      <span
+      <div
         v-if="exporting"
-        style="margin-left: 12px"
+        class="progress"
       >
-        {{ progressText }}
-        {{ progress }}%
-      </span>
+        <div class="progress-track">
+          <div
+            class="progress-value"
+            :style="progressStyle"
+          />
+        </div>
+
+        <div>
+          {{ progressText }}
+          {{ progress }}%
+        </div>
+      </div>
     </div>
 
+    <!--
+      最好截图的是原始设计尺寸节点，
+      不要截图外层 transform scale 容器。
+    -->
     <div
       ref="reportRef"
-      style="
-        width: 1920px;
-        background: white;
-      "
+      class="report"
     >
-      <!--
-        这里放你的超长页面。
-
-        即使最终高度：
-
-        50000px
-        70000px
-        100000px
-
-        都不会创建对应高度 Canvas。
-      -->
-
       <div
-        v-for="index in 1000"
+        v-for="index in 800"
         :key="index"
-        style="
-          height: 100px;
-          border-bottom:
-            1px solid #ddd;
-          padding: 20px;
-          box-sizing:
-            border-box;
-        "
+        class="row"
       >
         第 {{ index }} 行内容
+
+        <strong>
+          Vue3 超长图片导出测试
+        </strong>
       </div>
     </div>
   </div>
 </template>
+
+<style scoped>
+.page {
+  background: #eee;
+}
+
+.toolbar {
+  position: sticky;
+  top: 0;
+  z-index: 1000;
+
+  display: flex;
+  align-items: center;
+  gap: 12px;
+
+  padding: 12px;
+
+  background: white;
+}
+
+.progress {
+  width: 300px;
+}
+
+.progress-track {
+  width: 100%;
+  height: 8px;
+
+  overflow: hidden;
+
+  background: #ddd;
+  border-radius: 4px;
+}
+
+.progress-value {
+  height: 100%;
+
+  background: #333;
+
+  transition: width 0.2s;
+}
+
+.report {
+  width: 1920px;
+
+  box-sizing: border-box;
+
+  background: white;
+}
+
+.row {
+  height: 100px;
+
+  box-sizing: border-box;
+
+  padding: 20px;
+
+  border-bottom:
+    1px solid #ddd;
+
+  font-size: 24px;
+}
+</style>
