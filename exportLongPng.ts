@@ -1,4 +1,6 @@
-import html2canvas from 'html2canvas';
+// src/utils/long-png/exportLongPng.ts
+
+import html2canvas from 'html2canvas-pro';
 
 import type {
   ExportLongPngOptions,
@@ -11,7 +13,7 @@ interface ReadyResponse {
 interface ChunkDoneResponse {
   type: 'chunk-done';
 
-  rows: number;
+  encodedRows: number;
 }
 
 interface DoneResponse {
@@ -19,11 +21,11 @@ interface DoneResponse {
 
   blob: Blob;
 
-  size: number;
-
   width: number;
 
   height: number;
+
+  size: number;
 }
 
 interface ErrorResponse {
@@ -38,22 +40,47 @@ type WorkerResponse =
   | DoneResponse
   | ErrorResponse;
 
-/**
- * 每一个 html2canvas Canvas
- * 建议控制在多少像素以内。
- *
- * 8M pixels：
- *
- * RGBA 大约：
- *
- * 8,000,000 × 4
- * ≈ 32MB
- *
- * 加上 Canvas 自身，
- * 当前分片整体通常几十 MB。
- */
+interface SliceInfo {
+  index: number;
+
+  /**
+   * CSS px
+   */
+  y: number;
+
+  /**
+   * CSS px
+   */
+  height: number;
+
+  /**
+   * scale 后预计 Canvas height
+   */
+  outputHeight: number;
+}
+
 const DEFAULT_PIXEL_BUDGET =
   8_000_000;
+
+const DEFAULT_MAX_CHUNK_HEIGHT =
+  3000;
+
+function createAbortError() {
+  return new DOMException(
+    'Export aborted.',
+    'AbortError',
+  );
+}
+
+function throwIfAborted(
+  signal?: AbortSignal,
+) {
+  if (
+    signal?.aborted
+  ) {
+    throw createAbortError();
+  }
+}
 
 function nextFrame() {
   return new Promise<void>(
@@ -66,63 +93,163 @@ function nextFrame() {
 }
 
 /**
- * 根据宽度和 scale
- * 自动计算安全 chunkHeight。
+ * 自动计算每片高度。
+ *
+ * pixel =
+ *
+ * width
+ * × chunkHeight
+ * × scale²
  */
 function getAutoChunkHeight(
   width: number,
   scale: number,
+  pixelBudget: number,
 ) {
-  /**
-   * 输出真实像素宽度
-   */
   const outputWidth =
     Math.floor(
-      width * scale,
+      width *
+        scale,
     );
 
-  /**
-   * 一个 CSS px 的纵向高度经过 scale 后，
-   * 会产生 scale 行实际像素。
-   */
-  const height =
+  const estimated =
     Math.floor(
-      DEFAULT_PIXEL_BUDGET /
+      pixelBudget /
         outputWidth /
         scale,
     );
 
-  /**
-   * 不要过大，
-   * 也不要太小导致分片数量过多。
-   */
   return Math.max(
-    500,
+    128,
     Math.min(
-      3000,
-      height,
+      DEFAULT_MAX_CHUNK_HEIGHT,
+      estimated,
     ),
   );
 }
 
 /**
- * Worker request-response。
+ * 提前计算所有分片。
  *
- * 我们每次只发送一块，
- * Worker 编码完后才发送下一块。
+ * 同时提前知道最终 PNG 高度。
+ */
+function createSlices(
+  totalHeight: number,
+  chunkHeight: number,
+  scale: number,
+): {
+  slices: SliceInfo[];
+
+  outputHeight: number;
+} {
+  const slices: SliceInfo[] =
+    [];
+
+  let outputHeight = 0;
+
+  let index = 0;
+
+  for (
+    let y = 0;
+    y < totalHeight;
+    y +=
+      chunkHeight
+  ) {
+    const height =
+      Math.min(
+        chunkHeight,
+        totalHeight - y,
+      );
+
+    /**
+     * html2canvas 的 Canvas
+     * 最终尺寸受 scale 影响。
+     */
+    const sliceOutputHeight =
+      Math.floor(
+        height *
+          scale,
+      );
+
+    if (
+      sliceOutputHeight <=
+      0
+    ) {
+      throw new Error(
+        'Invalid slice output height.',
+      );
+    }
+
+    slices.push({
+      index,
+
+      y,
+
+      height,
+
+      outputHeight:
+        sliceOutputHeight,
+    });
+
+    outputHeight +=
+      sliceOutputHeight;
+
+    index++;
+  }
+
+  return {
+    slices,
+    outputHeight,
+  };
+}
+
+/**
+ * Worker request / response。
  *
- * 因此不会出现几十块 RGBA
- * 同时堆积在 Worker queue。
+ * 每次必须等待 Worker 编完一片，
+ * 才发送下一片。
+ *
+ * 防止几十个 RGBA Buffer
+ * 堆积到 Worker 消息队列。
  */
 function requestWorker(
   worker: Worker,
-
   message: unknown,
-
   transfer: Transferable[] = [],
-) {
-  return new Promise<WorkerResponse>(
-    (resolve, reject) => {
+  signal?: AbortSignal,
+): Promise<WorkerResponse> {
+  return new Promise(
+    (
+      resolve,
+      reject,
+    ) => {
+      if (
+        signal?.aborted
+      ) {
+        reject(
+          createAbortError(),
+        );
+
+        return;
+      }
+
+      const cleanup = () => {
+        worker.removeEventListener(
+          'message',
+          onMessage,
+        );
+
+        worker.removeEventListener(
+          'error',
+          onError,
+        );
+
+        signal?.removeEventListener(
+          'abort',
+          onAbort,
+        );
+      };
+
       const onMessage = (
         event: MessageEvent<WorkerResponse>,
       ) => {
@@ -144,7 +271,9 @@ function requestWorker(
           return;
         }
 
-        resolve(response);
+        resolve(
+          response,
+        );
       };
 
       const onError = (
@@ -160,15 +289,11 @@ function requestWorker(
         );
       };
 
-      const cleanup = () => {
-        worker.removeEventListener(
-          'message',
-          onMessage,
-        );
+      const onAbort = () => {
+        cleanup();
 
-        worker.removeEventListener(
-          'error',
-          onError,
+        reject(
+          createAbortError(),
         );
       };
 
@@ -182,6 +307,14 @@ function requestWorker(
         onError,
       );
 
+      signal?.addEventListener(
+        'abort',
+        onAbort,
+        {
+          once: true,
+        },
+      );
+
       worker.postMessage(
         message,
         transfer,
@@ -190,31 +323,22 @@ function requestWorker(
   );
 }
 
-function throwIfAborted(
-  signal?: AbortSignal,
-) {
-  if (
-    signal?.aborted
-  ) {
-    throw new DOMException(
-      'Export aborted',
-      'AbortError',
-    );
-  }
-}
-
 /**
- * 超长 DOM → 单张 PNG Blob
+ * 超长 DOM
+ *
+ * ↓
+ *
+ * 单张完整 PNG Blob
  */
 export async function exportLongPng(
   element: HTMLElement,
-
   options: ExportLongPngOptions = {},
 ): Promise<Blob> {
   const {
     scale = 1,
 
-    compressionLevel = 3,
+    pixelBudget =
+      DEFAULT_PIXEL_BUDGET,
 
     backgroundColor =
       '#ffffff',
@@ -226,36 +350,14 @@ export async function exportLongPng(
     signal,
   } = options;
 
-  /**
-   * 为了保证：
-   *
-   * floor(chunk * scale)
-   *
-   * 的总和和
-   *
-   * floor(total * scale)
-   *
-   * 完全一致，
-   *
-   * 当前版本建议 scale 使用整数。
-   *
-   * 实际业务推荐直接 scale = 1。
-   */
   if (
-    !Number.isInteger(scale) ||
-    scale <= 0
+    !Number.isFinite(
+      scale,
+    ) ||
+    scale < 1
   ) {
     throw new Error(
-      'scale must be a positive integer. Recommended value: 1.',
-    );
-  }
-
-  if (
-    compressionLevel < 0 ||
-    compressionLevel > 9
-  ) {
-    throw new Error(
-      'compressionLevel must be between 0 and 9.',
+      'scale must be >= 1.',
     );
   }
 
@@ -264,9 +366,7 @@ export async function exportLongPng(
   );
 
   /**
-   * 等待 WebFont。
-   *
-   * 否则截图时可能字体还没加载完。
+   * 等字体加载完成。
    */
   if (
     document.fonts
@@ -274,6 +374,16 @@ export async function exportLongPng(
     await document.fonts.ready;
   }
 
+  throwIfAborted(
+    signal,
+  );
+
+  /**
+   * transform 不会影响 scrollWidth /
+   * scrollHeight。
+   *
+   * 对你的 1920px 设计稿非常合适。
+   */
   const width =
     Math.ceil(
       element.scrollWidth,
@@ -289,24 +399,17 @@ export async function exportLongPng(
     totalHeight <= 0
   ) {
     throw new Error(
-      'Invalid element size.',
+      `Invalid element size: ${width} × ${totalHeight}`,
     );
   }
 
   /**
-   * PNG 最终实际像素尺寸。
-   *
-   * html2canvas 内部 CanvasRenderer
-   * 使用 Math.floor(width * scale)。
+   * 最终 PNG 宽度。
    */
   const outputWidth =
     Math.floor(
-      width * scale,
-    );
-
-  const outputHeight =
-    Math.floor(
-      totalHeight * scale,
+      width *
+        scale,
     );
 
   const chunkHeight =
@@ -314,16 +417,43 @@ export async function exportLongPng(
     getAutoChunkHeight(
       width,
       scale,
+      pixelBudget,
     );
+
+  if (
+    chunkHeight <= 0
+  ) {
+    throw new Error(
+      'chunkHeight must be > 0.',
+    );
+  }
+
+  const {
+    slices,
+    outputHeight,
+  } =
+    createSlices(
+      totalHeight,
+      chunkHeight,
+      scale,
+    );
+
+  if (
+    outputWidth >
+      0x7fffffff ||
+    outputHeight >
+      0x7fffffff
+  ) {
+    throw new Error(
+      `PNG size is too large: ${outputWidth} × ${outputHeight}`,
+    );
+  }
 
   const totalChunks =
-    Math.ceil(
-      totalHeight /
-        chunkHeight,
-    );
+    slices.length;
 
   console.info(
-    '[long-png]',
+    '[long-png] start',
     {
       cssSize:
         `${width} × ${totalHeight}`,
@@ -357,4 +487,405 @@ export async function exportLongPng(
     const initResponse =
       await requestWorker(
         worker,
-   
+        {
+          type: 'init',
+
+          width:
+            outputWidth,
+
+          height:
+            outputHeight,
+        },
+        [],
+        signal,
+      );
+
+    if (
+      initResponse.type !==
+      'ready'
+    ) {
+      throw new Error(
+        'Unexpected PNG worker initialization response.',
+      );
+    }
+
+    let finalBlob:
+      | Blob
+      | undefined;
+
+    for (
+      let currentIndex = 0;
+      currentIndex <
+      slices.length;
+      currentIndex++
+    ) {
+      throwIfAborted(
+        signal,
+      );
+
+      const slice =
+        slices[
+          currentIndex
+        ];
+
+      onProgress?.({
+        phase:
+          'capture',
+
+        progress:
+          currentIndex /
+          totalChunks,
+
+        current:
+          currentIndex +
+          1,
+
+        total:
+          totalChunks,
+      });
+
+      let canvas:
+        | HTMLCanvasElement
+        | undefined;
+
+      try {
+        /**
+      * 每次只创建：
+         *
+         * 1920 × 3000
+         *
+         * 之类的小 Canvas。
+         *
+         * 永远不会创建：
+         *
+         * 1920 × 70000。
+         */
+        canvas =
+          await html2canvas(
+            element,
+            {
+              scale,
+
+              /**
+               * html2canvas-pro 文档中：
+               *
+               * x/y 是针对元素的裁剪坐标。
+               */
+              x: 0,
+
+              y:
+                slice.y,
+
+              width,
+
+              height:
+                slice.height,
+
+              backgroundColor,
+
+              useCORS,
+
+              logging: false,
+
+              removeContainer:
+                true,
+
+              /**
+               * 对你的 1920
+               * 设计稿非常重要。
+               *
+               * 防止截图时媒体查询
+               * 变成笔记本屏幕宽度。
+               */
+              windowWidth:
+                options.windowWidth ??
+                width,
+
+              windowHeight:
+                options.windowHeight ??
+                window.innerHeight,
+
+              /**
+               * html2canvas-pro
+               * 默认会进行 DOM normalize。
+               *
+               * 对存在 transform: scale()
+               * 的大屏页面通常更合适。
+               */
+              normalizeDom:
+                true,
+            },
+          );
+
+        throwIfAborted(
+          signal,
+        );
+
+        if (
+          canvas.width !==
+          outputWidth
+        ) {
+          throw new Error(
+            [
+              'Unexpected canvas width.',
+              `Expected ${outputWidth},`,
+              `received ${canvas.width}.`,
+            ].join(' '),
+          );
+        }
+
+        if (
+          canvas.height !==
+          slice.outputHeight
+        ) {
+          throw new Error(
+            [
+              'Unexpected canvas height.',
+              `Expected ${slice.outputHeight},`,
+              `received ${canvas.height}.`,
+            ].join(' '),
+          );
+        }
+
+        const context =
+          canvas.getContext(
+            '2d',
+            {
+              /**
+               * Chrome 对频繁 getImageData()
+               * 会给这个优化提示。
+               */
+              willReadFrequently:
+                true,
+            },
+          );
+
+        if (!context) {
+          throw new Error(
+            'Unable to get Canvas 2D context.',
+          );
+        }
+
+        /**
+         * 当前分片 RGBA。
+         */
+        const imageData =
+          context.getImageData(
+            0,
+            0,
+            canvas.width,
+            canvas.height,
+          );
+
+        /**
+         * ArrayBuffer 所有权直接
+         * Transfer 给 Worker。
+         *
+         * 不复制。
+         */
+        const buffer =
+          imageData.data
+            .buffer as ArrayBuffer;
+
+        const isLast =
+          currentIndex ===
+          slices.length -
+            1;
+
+        onProgress?.({
+          phase:
+            'encode',
+
+          progress:
+            currentIndex /
+            totalChunks,
+
+          current:
+            currentIndex +
+            1,
+
+          total:
+            totalChunks,
+        });
+
+        const response =
+          await requestWorker(
+            worker,
+            {
+              type:
+                'chunk',
+
+              buffer,
+
+              /**
+               * 一定使用 Canvas
+               * 实际像素高度。
+               */
+              height:
+                canvas.height,
+
+              isLast,
+            },
+            [
+              buffer,
+            ],
+            signal,
+          );
+
+        if (isLast) {
+          if (
+            response.type !==
+            'done'
+          ) {
+            throw new Error(
+              'Unexpected final worker response.',
+            );
+          }
+
+          finalBlob =
+            response.blob;
+
+          console.info(
+            '[long-png] finished',
+            {
+              width:
+                response.width,
+
+              height:
+                response.height,
+
+              size:
+                response.size,
+            },
+          );
+        } else {
+          if (
+            response.type !==
+            'chunk-done'
+          ) {
+            throw new Error(
+              'Unexpected worker response.',
+            );
+          }
+        }
+      } finally {
+        /**
+         * html2canvas 当前分片立即释放。
+         */
+        if (canvas) {
+          canvas.width = 0;
+
+          canvas.height = 0;
+
+          canvas = undefined;
+        }
+      }
+
+      onProgress?.({
+        phase:
+          'encode',
+
+        progress:
+          (currentIndex +
+            1) /
+          totalChunks,
+
+        current:
+          currentIndex +
+          1,
+
+        total:
+          totalChunks,
+      });
+
+      /**
+       * 给浏览器：
+       *
+       * - UI
+       * - GC
+       * - RAF
+       *
+       * 一个执行机会。
+       */
+      await nextFrame();
+    }
+
+    if (!finalBlob) {
+      throw new Error(
+        'PNG Blob was not generated.',
+      );
+    }
+
+    onProgress?.({
+      phase: 'done',
+
+      progress: 1,
+
+  current:
+        totalChunks,
+
+      total:
+        totalChunks,
+    });
+
+    return finalBlob;
+  } finally {
+    /**
+     * 无论：
+     *
+     * 成功
+     * 失败
+     * Abort
+     *
+     * 都关闭 Worker。
+     */
+    worker.terminate();
+  }
+}
+
+/**
+ * 下载 Blob。
+ */
+export function downloadBlob(
+  blob: Blob,
+  filename =
+    'long-image.png',
+) {
+  const url =
+    URL.createObjectURL(
+      blob,
+    );
+
+  const anchor =
+    document.createElement(
+      'a',
+    );
+
+  anchor.href = url;
+
+  anchor.download =
+    filename;
+
+  anchor.style.display =
+    'none';
+
+  document.body.appendChild(
+    anchor,
+  );
+
+  anchor.click();
+
+  anchor.remove();
+
+  /**
+   * 不要 click 完立刻 revoke。
+   */
+  setTimeout(
+    () => {
+      URL.revokeObjectURL(
+        url,
+      );
+    },
+    3000,
+  );
+}
