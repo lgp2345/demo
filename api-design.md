@@ -293,3 +293,222 @@ Access Token
 - `patch`、`delete` 和 `cancelKey` 当前基本没有业务调用，属于预留能力。
 - 如果以后把 API 改成真正的跨域绝对地址，需要重新确认 Axios 的 Cookie凭据配置；当前相对 `/api` 的同源模式没有这个问题。
 - “第二次组织切换直接复用第一次 Promise”的策略会忽略用户最新一次选择；目前 UI 禁止连续点击，所以问题不大，但它属于需要明确的产品语义。
+
+
+不是不能，而是“不适合把全部功能塞进去”。现在的设计其实已经封装了，只是封装入口是 `createWebSession`，不是 `createApiClient`。
+
+## 两者管理的是不同生命周期
+
+| 模块 | 管理的事情 |
+|---|---|
+| `createApiClient` | 一次 HTTP 请求如何发送、解析、重试、取消 |
+| `createWebSession` | 用户从登录到退出期间，认证、组织、权限、菜单如何保持一致 |
+
+`createApiClient` 关心的是：
+
+```text
+请求 → Token → 响应解析 → 401 刷新 → 重试
+```
+
+`web-session` 关心的是：
+
+```text
+登录 → 获取用户 → 更新 Store → 加载组织菜单
+切换组织 → 换 Token → 换权限 → 换菜单
+退出 → 清理所有本地状态
+```
+
+后者已经属于业务流程，而不只是 HTTP。
+
+## 为什么 401 刷新又放在 `createApiClient` 里
+
+这里做了一个比较合理的职责切割。
+
+`createApiClient` 负责通用机制：
+
+```ts
+401
+→ 调用 refreshAccessToken
+→ 使用新 Token 重放原请求
+```
+
+但它不知道 Refresh Token 在哪里，也不知道刷新成功后应该更新哪个 Store：
+
+```ts
+refreshAccessToken?: (
+  requestAccessToken: string,
+) => Promise<string | null>
+```
+
+具体的 WEB 策略由 [web-session.ts](/Users/liuguoping/code/Xpense/apps/web/src/services/web-session.ts:345) 注入：
+
+```ts
+refreshAccessToken: async (requestAccessToken) => {
+  const { accessToken } = await apiClient.post(
+    "/auth/refresh",
+    undefined,
+    {
+      authFailure: "ignore",
+      authRefresh: "ignore",
+    },
+  );
+
+  // 确认这还是当前会话
+  if (authStore.getState().accessToken !== requestAccessToken) {
+    return null;
+  }
+
+  authStore.getState().setAccessToken(accessToken);
+  return accessToken;
+}
+```
+
+也就是说：
+
+```text
+api-client：我知道何时需要刷新
+web-session：我知道 WEB 应该怎样刷新
+```
+
+这是依赖倒置：底层客户端通过回调请求上层提供策略，而不是直接依赖 Zustand 和 WEB 登录实现。
+
+## 如果都塞进 `createApiClient` 会怎样
+
+它的参数可能会变成这样：
+
+```ts
+createApiClient({
+  baseUrl,
+  authStore,
+  menuStore,
+  clientType: "web_pc",
+  loadMenus,
+  getCurrentUser,
+  onLogin,
+  onLogout,
+  onOrganizationSwitch,
+})
+```
+
+随后会产生几个问题。
+
+### 1. 通用客户端与 WEB 业务绑死
+
+现在公共接口可以这样创建：
+
+```ts
+createApiClient({
+  baseUrl,
+  getAccessToken: () => null,
+})
+```
+
+例如 [foundation-api.ts](/Users/liuguoping/code/Xpense/apps/web/src/services/foundation-api.ts:10) 就不需要登录态。
+
+如果把 `web-session` 塞进去，即使只是调用公开接口，也要引入：
+
+- `authStore`
+- `menuStore`
+- WEB Cookie 刷新逻辑
+- 组织切换逻辑
+
+客户端就不再通用了。
+
+### 2. 移动端与 WEB 的刷新方式不同
+
+WEB：
+
+```text
+Refresh Token → HttpOnly Cookie
+```
+
+移动端：
+
+```text
+Refresh Token → JSON body / 安全存储
+```
+
+服务端已经明确区分这两种传输方式，见 [auth.service.ts](/Users/liuguoping/code/Xpense/apps/server/src/modules/auth/auth.service.ts:361)。
+
+如果 `createApiClient` 内置 WEB Cookie 流程，以后移动端就无法复用；如果同时兼容两套流程，`createApiClient` 又会充满平台判断。
+
+### 3. HTTP 客户端开始理解组织和菜单
+
+切换组织时，`web-session` 需要：
+
+1. 暂时清理旧菜单。
+2. 请求切换组织。
+3. 保存新 Token。
+4. 获取新用户、角色和权限。
+5. 加载新组织菜单。
+6. 防止旧请求覆盖新登录状态。
+
+见 [web-session.ts](/Users/liuguoping/code/Xpense/apps/web/src/services/web-session.ts:137)。
+
+这些都是 Xpense 的业务语义。一个 HTTP 客户端不应该知道“组织”“权限”“菜单”是什么。
+
+### 4. 容易形成循环依赖
+
+目前关系是：
+
+```text
+api-client
+    ↑
+auth-api / iam-api
+    ↑
+web-session
+```
+
+其中：
+
+- `auth-api` 需要 `apiClient`
+- `web-session` 需要 `authApi`
+- Token 刷新又需要调用 `/auth/refresh`
+
+如果把完整会话流程放进 `createApiClient`，它就要同时创建或了解 `authApi`，依赖关系会变成环。
+
+现在通过回调解决了这个问题：客户端只调用 `refreshAccessToken()`，不需要知道刷新接口和 Store 的具体实现。
+
+## 现在其实已经提供了统一封装入口
+
+[createWebSession](/Users/liuguoping/code/Xpense/apps/web/src/services/web-session.ts:345) 正是整个 WEB API 系统的“组装入口”：
+
+```ts
+const apiClient = createApiClient(...)
+const authApi = createAuthApi(apiClient)
+const iamApi = createIamApi(apiClient)
+
+return {
+  authApi,
+  iamApi,
+  authStore,
+  menuStore,
+  restoreSession,
+}
+```
+
+业务页面最终使用的是：
+
+```ts
+webSession.authApi
+webSession.iamApi
+webSession.authStore
+webSession.menuStore
+```
+
+因此并不是没有封装，而是采用了组合：
+
+```text
+createApiClient      创建通用通信能力
+createAuthApi        创建认证领域接口
+createIamApi         创建权限领域接口
+createWebSession     把上述能力组合成完整 WEB 会话
+```
+
+## 我的判断
+
+当前边界总体合理。最值得保留的原则是：
+
+> `createApiClient` 负责请求级机制，`createWebSession` 负责会话级业务一致性。
+
+可以把两者在目录或命名上整理得更清楚，例如将 `web-session.ts` 视为 `application service` 或 `session coordinator`，但不建议把登录、退出、组织切换、权限和菜单同步全部下沉进 `createApiClient`。那会让一个已经 382 行的请求客户端承担更多不属于它的职责。
